@@ -40,6 +40,18 @@ export function toFileUri(input) {
   return unc ? 'file://' + encoded : 'file:///' + encoded;
 }
 
+/**
+ * 按扩展名猜 MIME。sendImage 的 base64 回退要用，协议端靠它判断图片类型。
+ */
+function mimeFromPath(file) {
+  const ext = String(file || '').toLowerCase().split('.').pop();
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'bmp') return 'image/bmp';
+  return 'image/png';
+}
+
 export class SendQueue {
   constructor({ onebot, store, onSent = null, log = null }) {
     this.onebot = onebot;
@@ -314,10 +326,22 @@ export class SendQueue {
         });
       } catch (error) {
         // file:// 失败 → 回退 base64（协议端不同机、路径不可读、权限不足等）。
-        // 只在**有 dataUrl 备份**且**确实是 local 路径**时才回退，避免无意义重试。
-        if (!file || !dataUrl) throw error;
+        // 没有 dataUrl 备份时从本地文件现读一份：容器/跨机部署下 file:/// 必然失败，
+        // 只传 file 的调用方（插件里的发表情、发图工具）否则全都发不出图。
+        if (!file) throw error;
+        let fallback = dataUrl;
+        if (!fallback) {
+          try {
+            const buf = fs.readFileSync(file);
+            if (buf.length > 15 * 1024 * 1024) throw new Error('图片超过 15MB');
+            fallback = `data:${mimeFromPath(file)};base64,${buf.toString('base64')}`;
+          } catch (readErr) {
+            this.log?.(`本地路径读不到（${readErr?.message ?? readErr}），无法回退 base64`);
+            throw error;
+          }
+        }
         this.log?.(`本地路径发送失败（${error?.message ?? error}），回退 base64 重试一次`);
-        data = await this.onebot.sendImage(kind, id, dataUrl, {
+        data = await this.onebot.sendImage(kind, id, fallback, {
           replyToMessageId: options.replyToMessageId ?? null,
           atUserId: options.atUserId ?? null
         });
