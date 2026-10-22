@@ -1058,6 +1058,20 @@ export function createApp({ log = console.log } = {}) {
     if (event.post_type === 'notice' && event.notice_type === 'group_ban') {
       return handleGroupBan(event);
     }
+    // 好友/入群请求：OneBot 的 post_type=request。
+    // 插件注册的 friend.request / group.request 钩子此前从未被触发 ——
+    // 请求事件在这里就被丢掉了，插件里那套处理逻辑等于死代码。
+    if (event.post_type === 'request') {
+      const kind = event.request_type === 'friend' ? 'friend'
+        : (event.request_type === 'group' ? 'group' : null);
+      if (!kind) return;
+      try {
+        await skillManager.runHook(`${kind}.request`, { event, onebot });
+      } catch (error) {
+        log(`[request] 处理${kind === 'friend' ? '好友' : '入群'}请求出错：${error?.message ?? error}`);
+      }
+      return;
+    }
     // meta/心跳等事件忽略
   }
 
