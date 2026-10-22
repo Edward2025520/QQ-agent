@@ -532,7 +532,9 @@ export async function bingImageSearch(query, { limit = 8, browseLocked = false }
   if (!q) throw new Error('搜索关键词为空');
   const url = `https://cn.bing.com/images/search?q=${encodeURIComponent(q)}&form=HDRSC2`;
   // 图搜是"搜索阶段"，也必须受浏览锁定约束，否则锁定只挡下载不挡搜索，链条断一环
-  const { body } = await safeFetch(url, { browseLocked });
+  // Bing 图片页有 170KB+：前 50KB 只有样式和脚本，结果块从 52KB 才开始、murl 在 100KB 之后。
+  // 沿用 safeFetch 的默认 50000 会永远解析出 0 条。
+  const { body } = await safeFetch(url, { browseLocked, maxBytes: 400000 });
   const html = String(body ?? '');
   const out = [];
   const seen = new Set();
