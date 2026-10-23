@@ -1,0 +1,23 @@
+{
+  "id": "pinned-facts",
+  "name": "固定事实",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "knowledge",
+  "entry": "index.js",
+  "description": "把长期不变的事实（谁是谁、别名、主人口径）单独存一份，每轮注入提示词；不受记忆整理影响。号码类信息只在白名单私聊里给出，群聊自动打码。",
+  "author": "本地定制",
+  "enabledByDefault": true,
+  "capabilities": ["pinned-facts.preview"],
+  "requires": [],
+  "settings": {
+    "enabled": true
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用固定事实",
+      "description": "关掉后不再注入 data/pinned-facts.json 里的内容。"
+    }
+  }
+}
