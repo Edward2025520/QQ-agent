@@ -147,6 +147,12 @@ function recentImpressions(days, chatKey) {
   }));
 }
 
+function scrubQq(text) {
+  const qq = ownerQq();
+  if (!qq) return String(text || "");
+  return String(text || "").split(qq).join("老大");
+}
+
 /** 非熟人：把老大的名字与号码换成"老大"。 */
 function scrub(text) {
   const name = ownerName();
@@ -165,8 +171,9 @@ function buildDigest(chatKey, s = settings()) {
     lines.push(`· ${chatLabel(c.chatKey)} ${hhmm(c.when)}：${c.text}`);
   }
   for (const m of recentImpressions(Number(s.days) || 7, chatKey)) {
+    if (!trusted && String(m.uid) === ownerQq()) continue; // 非熟人完全不注入主人的印象，避免脱敏后读起来别扭
     const who = String(m.uid) === ownerQq()
-      ? (trusted ? `${ownerName()}(QQ:${m.uid})` : '老大')
+      ? (trusted ? ownerName() : "老大")
       : `${m.name}(QQ:${m.uid})`;
     lines.push(`· 你对 ${who} 的印象：${m.imps.join('｜')}`);
   }
@@ -185,7 +192,7 @@ function buildDigest(chatKey, s = settings()) {
   const kept = [];
   let chars = head.length + tail.join('').length;
   for (const line of lines) {
-    const text = trusted ? line : scrub(line);
+    const text = trusted ? scrubQq(line) : scrub(line);
     if (kept.length >= maxLines) break;
     if (chars + text.length > maxChars) break;
     kept.push(text);
