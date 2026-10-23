@@ -1,0 +1,41 @@
+{
+  "id": "dm-notice",
+  "name": "好友回信通知",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "entry": "index.js",
+  "description": "好友（friend-dm 名单里的人）回消息后，把这一轮「对方说了什么 + 呆猫回了什么」合并成一条通知，推到主人私聊。走 OneBot HTTP，不新增 WS 连接。",
+  "author": "本地定制",
+  "enabledByDefault": true,
+  "capabilities": [],
+  "requires": [],
+  "settings": {
+    "enabled": true,
+    "debounceSec": 15,
+    "maxChars": 400,
+    "dryRun": false
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用好友回信通知",
+      "description": "关掉后好友回消息不再提示主人。"
+    },
+    "debounceSec": {
+      "type": "number",
+      "label": "合并间隔（秒）",
+      "description": "默认 15 秒。同一批来回只推一条。"
+    },
+    "maxChars": {
+      "type": "number",
+      "label": "通知字数上限",
+      "description": "默认 400 字。"
+    },
+    "dryRun": {
+      "type": "boolean",
+      "label": "演练模式",
+      "description": "只写日志不真的发通知，用于先观察内容。"
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "shared-memory",
+  "name": "跨会话共享记忆",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "knowledge",
+  "entry": "index.js",
+  "description": "把最近 6 小时里别的会话聊过的事压成一小段，每轮带上；更早的内容可以用 shared-memory__recall 在 7 天内检索。只读 data/memory 与 data/memory-v2，不新建存储。",
+  "author": "本地定制",
+  "enabledByDefault": true,
+  "capabilities": ["memory.shared-preview"],
+  "requires": [],
+  "settings": {
+    "enabled": true,
+    "hours": 6,
+    "days": 7,
+    "maxChars": 900,
+    "maxLines": 12,
+    "maxRecallChars": 3000,
+    "includeCurrentChat": false
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用跨会话共享记忆",
+      "description": "关掉后每轮不再注入别的会话的内容，检索工具也一起停用。"
+    },
+    "hours": {
+      "type": "number",
+      "label": "每轮带最近几小时",
+      "description": "默认 6 小时。只有这个窗口内的跨会话内容会自动进提示词。"
+    },
+    "days": {
+      "type": "number",
+      "label": "可检索天数",
+      "description": "默认 7 天，与清理脚本的保留期一致。"
+    },
+    "maxChars": {
+      "type": "number",
+      "label": "注入字数上限",
+      "description": "默认 900 字，超了从最旧的开始截。"
+    },
+    "maxLines": {
+      "type": "number",
+      "label": "注入行数上限",
+      "description": "默认 12 行。"
+    },
+    "maxRecallChars": {
+      "type": "number",
+      "label": "检索返回字数上限",
+      "description": "默认 3000 字。"
+    },
+    "includeCurrentChat": {
+      "type": "boolean",
+      "label": "连当前会话也带一遍",
+      "description": "默认关，当前会话的印象由核心注入，不重复。"
+    }
+  }
+}

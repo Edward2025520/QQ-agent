@@ -1,0 +1,87 @@
+{
+  "id": "friend-dm",
+  "name": "好友私信",
+  "version": "1.0.0-local",
+  "apiVersion": 1,
+  "category": "message",
+  "entry": "index.js",
+  "description": "让机器人知道自己的好友列表，并在主人要求或自行判断时，给指定好友发私聊。带名单白名单、静默时段、每人每日上限和多轮间隔；默认不启用。",
+  "author": "本地自建",
+  "enabledByDefault": false,
+  "permissions": [],
+  "settings": {
+    "friends": [],
+    "ownerIds": "10001",
+    "autonomy": true,
+    "dailyCapPerFriend": 1,
+    "manualDailyCap": 5,
+    "minIntervalHours": 24,
+    "quietStart": "22:00",
+    "quietEnd": "08:00",
+    "maxAutonomyPerDay": 3,
+    "reportToOwner": true,
+    "dryRun": false
+  },
+  "configSchema": {
+    "ownerIds": {
+      "type": "string",
+      "label": "主人 QQ 号",
+      "description": "多个用逗号分隔。只有这些号码能让机器人发私聊、改名单。留空 = 指令类工具全部拒绝。"
+    },
+    "autonomy": {
+      "type": "boolean",
+      "label": "允许自主发起",
+      "description": "开启后，机器人会按间隔和限额自行给名单里的人发消息。关闭后只响应明确指令。"
+    },
+    "dailyCapPerFriend": {
+      "type": "number",
+      "label": "每人每天上限（自主发送）",
+      "description": "机器人自己主动发起时，同一个人一天最多收几条。默认 1，0 表示不限。"
+    },
+    "manualDailyCap": {
+      "type": "number",
+      "label": "每人每天上限（主人指令）",
+      "description": "主人明确让它传话时用的上限，默认 5。指令不受静默时段和最短间隔限制，只受这个上限约束。"
+    },
+    "minIntervalHours": {
+      "type": "number",
+      "label": "同一人最短间隔（小时）",
+      "description": "默认 24。自主发送和主动指令都按这个间隔判断。"
+    },
+    "quietStart": {
+      "type": "string",
+      "label": "静默开始时间",
+      "description": "24 小时制 HH:MM，默认 22:00。与结束时间相同时表示不设静默。"
+    },
+    "quietEnd": {
+      "type": "string",
+      "label": "静默结束时间",
+      "description": "24 小时制 HH:MM，默认 08:00。支持跨零点。"
+    },
+    "maxAutonomyPerDay": {
+      "type": "number",
+      "label": "全站自主发送上限",
+      "description": "所有好友加起来一天最多自主发几条，默认 3，防止一次性骚扰一圈人。"
+    },
+    "reportToOwner": {
+      "type": "boolean",
+      "label": "自主发送后回报主人",
+      "description": "开启后在主人的私聊里回一行，说明刚给谁发了什么。"
+    },
+    "dryRun": {
+      "type": "boolean",
+      "label": "演练模式",
+      "description": "只记录不真的发送，用于先观察判断是否合理。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "friend-dm-policy",
+        "title": "好友私信",
+        "priority": 76,
+        "content": "你有一份好友名单，可以用 friend-dm__friend_dm 给名单里的人发私聊，用 friend-dm__friend_dm_status 查额度和静默时段。名单由主人维护，用 friend-dm__friend_roster 查看或增删；名单外的人一律不发。只有在主人明确要求转达、或你判断确实该问候一个人时才用；不要拿它当普通搜索或闲聊入口，也不要连续给同一个人发。转达主人的话时，时间、地点、事项这些关键信息照原话说，其余语气按你自己的说话方式。你的身份就是你自己，不要提自己是机器人、助手或程序。工具名都带 friend-dm__ 前缀，不要只写短名。发完不要在群里复述内容。"
+      }
+    ]
+  }
+}

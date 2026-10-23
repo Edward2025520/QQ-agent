@@ -1,0 +1,8 @@
+[Unit]
+Description=QQ Agent 滚动清理（聊天记录/印象/会话片段/对话会话）
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/qq-agent-retention --days 7 --data-root /opt/qq-agent/data
+Nice=10

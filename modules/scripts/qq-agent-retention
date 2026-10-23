@@ -1,0 +1,349 @@
+#!/usr/bin/env node
+// qq-agent 7 天滚动清理
+// 四个库：messages / memory（印象）/ memory-v2 chunks+索引 / sessions
+// 软删除：先备份到 data/backups/retention/<日期>/，备份本身再留 7 天
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+
+const DAY = 86400e3;
+
+function parseArgs(argv) {
+  const out = { days: 7, dataRoot: '/opt/qq-agent/data', dryRun: false, noRestart: false, backupDays: 7 };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '--days') out.days = Number(argv[++i]) || 7;
+    else if (a === '--backup-days') out.backupDays = Number(argv[++i]) || 7;
+    else if (a === '--data-root') out.dataRoot = String(argv[++i] || out.dataRoot);
+    else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--no-restart') out.noRestart = true;
+  }
+  out.days = Math.max(1, out.days);
+  return out;
+}
+
+const opts = parseArgs(process.argv.slice(2));
+const DATA = path.resolve(opts.dataRoot);
+const CUTOFF = Date.now() - opts.days * DAY;
+const STAMP = new Date().toISOString().slice(0, 10);
+const BACKUP = path.join(DATA, 'backups', 'retention', STAMP);
+const DISK_BUDGET_MB = 150;
+
+const log = (msg) => console.log(`[retention] ${msg}`);
+const changed = { files: 0, entries: 0 };
+const manifest = [];
+
+function safeReadJson(file) {
+  try {
+    let text = fs.readFileSync(file, 'utf8');
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonAtomic(file, value) {
+  if (opts.dryRun) return;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 1), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function backupFile(file, reason) {
+  const rel = path.relative(DATA, file);
+  manifest.push({ file: rel, reason, at: Date.now() });
+  if (opts.dryRun) return true;
+  try {
+    const dest = path.join(BACKUP, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(file, dest);
+    return true;
+  } catch (error) {
+    log(`备份失败，跳过删除：${rel}（${error?.message ?? error}）`);
+    return false;
+  }
+}
+
+function dropFile(file, reason) {
+  if (!backupFile(file, reason)) return false;
+  if (!opts.dryRun) {
+    try { fs.unlinkSync(file); } catch { return false; }
+  }
+  changed.files += 1;
+  log(`${opts.dryRun ? '将删除' : '删除'} ${path.relative(DATA, file)}（${reason}）`);
+  return true;
+}
+
+function listFiles(dir) {
+  try {
+    return fs.readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => path.join(dir, f));
+  } catch {
+    return [];
+  }
+}
+
+// ── 1. 聊天记录 ───────────────────────────────────────────────────────────
+
+function pruneMessages() {
+  const dir = path.join(DATA, 'messages');
+  const KEEP_MIN = 2000;
+  let touched = 0;
+  for (const file of listFiles(dir)) {
+    const data = safeReadJson(file);
+    if (!data || !Array.isArray(data.messages)) continue;
+    const total = data.messages.length;
+    let kept = data.messages.filter((m) => (Number(m?.ts) || 0) >= CUTOFF);
+    if (kept.length > KEEP_MIN) kept = kept.slice(-KEEP_MIN);
+    if (kept.length === total) continue;
+    if (!backupFile(file, `messages:${total - kept.length}条`)) continue;
+    data.messages = kept;
+    writeJsonAtomic(file, data);
+    changed.entries += total - kept.length;
+    touched += 1;
+  }
+  log(`聊天记录：${touched} 个会话被裁剪`);
+}
+
+// ── 2. 印象 ───────────────────────────────────────────────────────────────
+
+function pruneMemory() {
+  const dir = path.join(DATA, 'memory');
+  let touched = 0;
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch { return log('印象：没有 memory 目录'); }
+
+  for (const name of dirs) {
+    if (name === 'backups') continue;
+    const chatDir = path.join(dir, name);
+    // 旧版单文件
+    if (fs.existsSync(`${chatDir}.json`)) pruneLegacy(chatDir);
+    for (const file of listFiles(chatDir)) {
+      if (path.basename(file) === '_meta.json') continue;
+      const data = safeReadJson(file);
+      if (!data) continue;
+      const list = Array.isArray(data.impressions) ? data.impressions : [];
+      const kept = list.filter((x) => (Number(x?.createdAt) || 0) >= CUTOFF);
+      if (kept.length === list.length) continue;
+      if (!kept.length) {
+        if (dropFile(file, `memory:全部过期(${list.length}条)`)) {
+          changed.entries += list.length;
+          touched += 1;
+        }
+        continue;
+      }
+      if (!backupFile(file, `memory:${list.length - kept.length}条`)) continue;
+      data.impressions = kept;
+      writeJsonAtomic(file, data);
+      changed.entries += list.length - kept.length;
+      touched += 1;
+    }
+    // 目录空了就删
+    try {
+      const left = fs.readdirSync(chatDir);
+      if (!left.length && !opts.dryRun) fs.rmdirSync(chatDir);
+    } catch { /* ignore */ }
+  }
+  log(`印象：${touched} 个成员文件被裁剪`);
+}
+
+function pruneLegacy(fileBase) {
+  const file = `${fileBase}.json`;
+  const data = safeReadJson(file);
+  if (!data || !Array.isArray(data.memberImpression)) return;
+  const before = data.memberImpression.length;
+  data.memberImpression = data.memberImpression.filter((x) => (Number(x?.createdAt) || 0) >= CUTOFF);
+  if (data.memberImpression.length === before) return;
+  if (!backupFile(file, `memory-legacy:${before - data.memberImpression.length}条`)) return;
+  writeJsonAtomic(file, data);
+  changed.entries += before - data.memberImpression.length;
+}
+
+// ── 3. 会话片段 + 索引 ────────────────────────────────────────────────────
+
+function pruneChunks() {
+  const chunkDir = path.join(DATA, 'memory-v2', 'chunks');
+  const files = listFiles(chunkDir);
+  const deleted = new Set();
+  for (const file of files) {
+    const data = safeReadJson(file);
+    const when = Number(data?.when) || 0;
+    if (!when || when >= CUTOFF) continue;
+    if (dropFile(file, 'chunk:超过保留期')) {
+      deleted.add(path.basename(file, '.json'));
+      changed.entries += 1;
+    }
+  }
+  if (!deleted.size) {
+    log('会话片段：无需清理');
+    return;
+  }
+  const indexPath = path.join(DATA, 'memory-v2', 'index.json');
+  const index = safeReadJson(indexPath);
+  if (!index) {
+    log('会话片段：索引读取失败，跳过重建');
+    return;
+  }
+  if (!backupFile(indexPath, `index:重建(${deleted.size}个chunk)`)) return;
+  const alive = new Set();
+  try {
+    for (const f of fs.readdirSync(chunkDir)) {
+      if (f.endsWith('.json')) alive.add(path.basename(f, '.json'));
+    }
+  } catch { /* ignore */ }
+  const next = { ...index };
+  if (next.chunks && typeof next.chunks === 'object') {
+    for (const id of Object.keys(next.chunks)) if (!alive.has(id)) delete next.chunks[id];
+  }
+  if (next.postings && typeof next.postings === 'object') {
+    for (const token of Object.keys(next.postings)) {
+      const arr = Array.isArray(next.postings[token]) ? next.postings[token] : [];
+      const kept = arr.filter((x) => alive.has(String(x?.chunkId || '')));
+      if (kept.length) next.postings[token] = kept;
+      else delete next.postings[token];
+    }
+  }
+  writeJsonAtomic(indexPath, next);
+  log(`会话片段：删除 ${deleted.size} 个，索引已重建`);
+}
+
+// ── 4. 对话会话 ───────────────────────────────────────────────────────────
+
+function pruneSessions() {
+  const dir = path.join(DATA, 'sessions');
+  let touched = 0;
+  for (const file of listFiles(dir)) {
+    const data = safeReadJson(file);
+    const startedAt = Number(data?.startedAt) || 0;
+    if (!startedAt || startedAt >= CUTOFF) continue;
+    if (dropFile(file, 'session:超过保留期')) touched += 1;
+  }
+  const cachePath = path.join(DATA, 'session-index-cache.json');
+  const cache = safeReadJson(cachePath);
+  if (cache && Array.isArray(cache.entries)) {
+    const before = cache.entries.length;
+    cache.entries = cache.entries.filter((e) => {
+      const id = String(e?.id || '');
+      return id && fs.existsSync(path.join(dir, `${id}.json`));
+    });
+    if (cache.entries.length !== before) {
+      if (backupFile(cachePath, 'session-index-cache:清理失效条目')) {
+        writeJsonAtomic(cachePath, cache);
+        changed.entries += before - cache.entries.length;
+      }
+    }
+  }
+  log(`对话会话：删除 ${touched} 个`);
+}
+
+// ── 5. 磁盘预算 ───────────────────────────────────────────────────────────
+
+function pruneByBudget() {
+  const roots = ['messages', 'memory', 'memory-v2'].map((d) => path.join(DATA, d));
+  const files = [];
+  const walk = (dir) => {
+    let list = [];
+    try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of list) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile() && p.endsWith('.json')) {
+        try { files.push({ p, size: fs.statSync(p).size, mtime: fs.statSync(p).mtimeMs }); } catch { /* ignore */ }
+      }
+    }
+  };
+  for (const r of roots) walk(r);
+  const total = files.reduce((n, f) => n + f.size, 0);
+  const budget = DISK_BUDGET_MB * 1024 * 1024;
+  log(`磁盘：${(total / 1024 / 1024).toFixed(1)} MB / 预算 ${DISK_BUDGET_MB} MB`);
+  if (total <= budget) return;
+  files.sort((a, b) => a.mtime - b.mtime);
+  let now = total;
+  for (const f of files) {
+    if (now <= budget) break;
+    if (dropFile(f.p, 'disk:超出磁盘预算')) now -= f.size;
+  }
+}
+
+// ── 6. 备份自身老化 ───────────────────────────────────────────────────────
+
+function pruneBackups() {
+  const root = path.join(DATA, 'backups', 'retention');
+  let dirs = [];
+  try { dirs = fs.readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory()); } catch { return; }
+  const cutoff = Date.now() - opts.backupDays * DAY;
+  for (const d of dirs) {
+    const full = path.join(root, d.name);
+    let mtime = 0;
+    try { mtime = fs.statSync(full).mtimeMs; } catch { continue; }
+    if (mtime >= cutoff) continue;
+    if (opts.dryRun) { log(`将删除旧备份 ${d.name}`); continue; }
+    try { fs.rmSync(full, { recursive: true, force: true }); log(`删除旧备份 ${d.name}`); } catch { /* ignore */ }
+  }
+}
+
+// ── 主流程 ────────────────────────────────────────────────────────────────
+
+async function serviceBusy() {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    const res = await fetch('http://127.0.0.1:3210/api/status', { signal: ctl.signal });
+    clearTimeout(timer);
+    const j = await res.json();
+    const o = j?.orchestrator || {};
+    return (o.running || []).length > 0 || (o.activeSessions || []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function restartService() {
+  try {
+    execFileSync('systemctl', ['restart', 'qq-agent'], { stdio: 'ignore' });
+    log('已重启 qq-agent');
+  } catch (error) {
+    log(`重启失败：${error?.message ?? error}`);
+  }
+}
+
+async function main() {
+  log(`开始：data=${DATA} 保留 ${opts.days} 天${opts.dryRun ? '（dry-run）' : ''}`);
+  if (!opts.dryRun && await serviceBusy()) {
+    log('有会话正在运行，本次跳过');
+    return;
+  }
+  const jobs = [
+    ['聊天记录', pruneMessages],
+    ['印象', pruneMemory],
+    ['会话片段', pruneChunks],
+    ['对话会话', pruneSessions]
+  ];
+  for (const [name, fn] of jobs) {
+    try { fn(); } catch (error) { log(`${name} 失败：${error?.message ?? error}`); }
+  }
+  try { pruneByBudget(); } catch (error) { log(`磁盘预算失败：${error?.message ?? error}`); }
+  try { pruneBackups(); } catch (error) { log(`备份老化失败：${error?.message ?? error}`); }
+
+  if (!opts.dryRun && manifest.length) {
+    const file = path.join(BACKUP, 'manifest.json');
+    try {
+      fs.mkdirSync(BACKUP, { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ at: Date.now(), days: opts.days, items: manifest }, null, 1), 'utf8');
+      log(`备份清单：${path.relative(DATA, file)}（${manifest.length} 项）`);
+    } catch (error) {
+      log(`写备份清单失败：${error?.message ?? error}`);
+    }
+  }
+
+  log(`完成：${changed.files} 个文件、${changed.entries} 条内容被清理`);
+  if (changed.files && !opts.dryRun && !opts.noRestart) restartService();
+}
+
+main().catch((error) => {
+  log(`异常退出：${error?.stack ?? error}`);
+  process.exit(1);
+});

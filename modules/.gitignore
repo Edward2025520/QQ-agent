@@ -1,0 +1,11 @@
+# QQ Agent 运行时数据，永远不要提交
+data/
+*.bak
+*.bak.*
+state.json
+*.log
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+node_modules/
