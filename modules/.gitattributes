@@ -7,3 +7,4 @@
 *.service text eol=lf
 *.timer text eol=lf
 qq-agent-retention text eol=lf
+*.patch text eol=lf
