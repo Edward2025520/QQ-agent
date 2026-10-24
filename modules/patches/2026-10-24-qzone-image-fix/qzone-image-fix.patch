@@ -1,0 +1,264 @@
+--- a/skills/qzone/index.js
++++ b/skills/qzone/index.js
+@@ -30,6 +30,7 @@
+ 
+ import { QzoneState } from './lib/state.js';
+ import { checkContent, mentionsPersonOrChat, isAllowedImageUrl, blockedWordCount } from './lib/safe-topic.js';
++import { headCheck, downloadHash, seenRecently, remember } from './lib/image-check.js';
+ import { fetchHotTopics } from './lib/hot.js';
+ import { pickMemes, parseTitle } from './lib/meme.js';
+ // ★ 本机补丁 2026-10-17：第二个图源 —— 网上抓图（发表情，有搜索/标签）。
+@@ -257,10 +258,11 @@
+             if (items.length >= want) break;
+             try {
+               const c = await cacheWebImage(fetchImpl, x.url, cacheDir);
++              if (c.hash && seenRecently(c.hash)) { skipped.push(x.desc.slice(0, 12) + '（最近发过）'); continue; }
+               items.push({
+                 来源: (x.origin === 'baidu' ? '网图（百度图片）' : '网图（必应图片）'),
+                 内容描述: x.desc + '（' + c.size.w + '×' + c.size.h + '）',
+-                url: relayUrl(rules().consolePort, c.key)
++                url: x.url
+               });
+             } catch (e) {
+               skipped.push(x.desc.slice(0, 12) + '（' + (e?.message ?? e) + '）');
+@@ -449,27 +451,25 @@
+             + '请改成只谈公共话题（游戏 / 动画 / 梗 / 科技），用自己的口吻写，不要出现任何群友、也不要复述群里聊了什么。');
+         }
+ 
+-        // 配图（可选）
++        // 配图（可选）：任意公网图片，先 HEAD 粗筛，再完整下载复核 + 查重。
++        // 失败一律明确报错，让模型换一张；不再静默降级成纯文字（那正是"图被拦住"的来源）。
+         let image = String(args.image || '').trim();
+-        // ★ 本机补丁 2026-10-17：网图先由主机带 Referer 下到本地，再换成本机中转地址。
+-        //   为什么不在挑图时就下：挑图时可能挑好几张、模型也可能最终不配图，白费流量。
+-        //   下载失败就退回纯文字 —— 绝不发一张抓不到的图。
+-        if (image && !/\/api\/qzone-img\//.test(image) && /soutula\.com|mm\.bing\.net|bing\.net|baidu\.com/i.test(image)) {
+-          try {
+-            const cacheDir = (process.env.QQ_AGENT_DATA_DIR || (process.cwd() + '/data')) + '/qzone/meme-cache';
+-            const cached = await cacheWebImage(fetchImpl, image, cacheDir);
+-            image = relayUrl(rules().consolePort, cached.key);
+-            log('[qzone] 网图已中转：' + cached.bytes + ' B');
+-          } catch (e) {
+-            imageNote = '（网图下载失败，已改发纯文字：' + (e?.message ?? e) + '）';
+-            image = '';
+-          }
+-        }
+         let imageNote = '';
+-        if (image && !isAllowedImageUrl(image)) {
+-          // 不在白名单就静默降级为纯文字，但要让模型知道原因
+-          imageNote = '（给的配图地址不在允许的图床白名单里，已忽略，改发纯文字）';
+-          image = '';
++        let imageHash = '';
++        if (image) {
++          const head = await headCheck(fetchImpl, image);
++          if (!head.ok) {
++            return err('配图不可用：' + head.reason + '。换一张图，或者这次不配图。');
++          }
++          const dl = await downloadHash(fetchImpl, image);
++          if (!dl.ok) {
++            return err('配图下载失败：' + dl.reason + '。换一张图，或者这次不配图。');
++          }
++          if (seenRecently(dl.hash)) {
++            return err('这张图最近发过了，换一张；实在没有就发纯文字。');
++          }
++          imageHash = dl.hash;
++          log('[qzone] 配图通过校验：' + dl.bytes + ' B ' + dl.mime);
+         }
+ 
+         const post = async (withImage) => ctx.onebot.call('send_qzone_msg', {
+@@ -491,6 +491,7 @@
+         }
+ 
+         const tid = resp?.tid ?? resp?.data?.tid ?? null;
++        if (imageHash) remember(imageHash, image);
+         state.recordPost({
+           content,
+           title: args.topicTitle || '',
+--- a/skills/qzone/lib/safe-topic.js
++++ b/skills/qzone/lib/safe-topic.js
+@@ -54,6 +54,8 @@
+ ];
+ 
+ /** 允许的图片主机（只有这些图床的图能进空间）。 */
++import { isPublicHttpUrl } from './image-check.js';
++
+ const ALLOWED_IMAGE_HOSTS = new Set(['img.aigengtu.com', 'aigengtu.com', 'img.soutula.com']);
+ // ↑ ★ 本机补丁 2026-10-17：加了 img.soutula.com（发表情的图床）——
+ //   用户要求配图不要只局限于鲸鱼娘，接了"发表情"这个有搜索/标签的网图来源。
+@@ -72,6 +74,12 @@
+ 
+ /** 只接受 http(s) 且主机在白名单内的图片地址。 */
+ export function isAllowedImageUrl(url) {
++  // 2026-10-24：域名白名单改成"任意公网 + 运行时校验"（见 lib/image-check.js）。
++  // 白名单时代搜图基本全灭，用户看到的现象是"配图被拦住、说说发不出去"。
++  return isPublicHttpUrl(url);
++}
++
++function isAllowedImageUrlLegacy(url) {
+   let u;
+   try { u = new URL(String(url == null ? '' : url)); } catch { return false; }
+   if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+--- a/skills/qzone/lib/meme-search.js
++++ b/skills/qzone/lib/meme-search.js
+@@ -27,6 +27,7 @@
+ import fs from 'node:fs';
+ import path from 'node:path';
+ import crypto from 'node:crypto';
++import { isPublicHttpUrl } from './image-check.js';
+ 
+ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+ const MAX_BYTES = 5 * 1024 * 1024;
+@@ -246,7 +247,7 @@
+   const u = String(url || '');
+   let host = '';
+   try { host = new URL(u).hostname; } catch { throw new Error('非法地址'); }
+-  if (!HOST_ALLOW.some((re) => re.test(host))) throw new Error('图床不在白名单（' + host + '）');
++  if (!isPublicHttpUrl(u)) throw new Error('不是可用的公网图片地址（' + host + '）');
+ 
+   const res = await fetchImpl(u, {
+     headers: { 'User-Agent': UA, accept: 'image/*', referer: 'https://memecub.com/' },
+@@ -262,11 +263,12 @@
+   if (!quality.ok) throw new Error('图不合格：' + quality.why);
+ 
+   const ext = (mime.includes('png') ? '.png' : mime.includes('gif') ? '.gif' : mime.includes('webp') ? '.webp' : '.jpg');
++  const hash = crypto.createHash('sha256').update(buf).digest('hex');
+   const key = crypto.createHash('sha1').update(u).digest('hex').slice(0, 16);
+   fs.mkdirSync(cacheDir, { recursive: true });
+   const file = path.join(cacheDir, key + ext);
+   if (!fs.existsSync(file)) fs.writeFileSync(file, buf);
+-  return { key, file, bytes: buf.length, mime, ext, size: quality.size };
++  return { key, file, bytes: buf.length, mime, ext, size: quality.size, hash };
+ }
+ 
+ /** 回环中转地址（协议端从这里取图）。 */
+--- /dev/null
++++ b/skills/qzone/lib/image-check.js
+@@ -0,0 +1,128 @@
++// 配图校验：把「只认几个图床」换成「任意公网图片，但先验证」。
++//
++// 为什么改：原来的 ALLOWED_IMAGE_HOSTS 只有 aigengtu / soutula 两个域名，搜图工具
++// 返回的图基本都在别处，于是 publish_qzone_post 静默降级成纯文字 —— 用户看到的
++// 就是"图片被拦住了，说说发不出去（带图）"。
++//
++// 安全边界由运行时检查承担，而不是域名白名单：
++//   · 只接受 http(s)，拒绝 localhost / 私网字面量 / .local
++//   · HEAD 粗筛（405 时退回 GET Range），content-type 必须是图片，长度有上限
++//   · 选中后完整下载复核（再次验 mime/大小），并算 sha256 用于查重
++import crypto from 'node:crypto';
++import fs from 'node:fs';
++import path from 'node:path';
++
++const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
++const IMAGE_MIME = /^image\/(jpeg|jpg|png|webp|gif)$/i;
++const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
++const USED_TTL_MS = 90 * 86400_000;
++
++function dataRoot() {
++  return process.env.QQ_AGENT_DATA_DIR || path.join(process.cwd(), 'data');
++}
++
++function usedFile() {
++  return path.join(dataRoot(), 'qzone', 'used-images.json');
++}
++
++/** 公网 http(s)？只做字面量判断，不解析 DNS（解析留给上层 safe-fetch）。 */
++export function isPublicHttpUrl(url) {
++  let u;
++  try { u = new URL(String(url || '')); } catch { return false; }
++  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
++  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
++  if (!h) return false;
++  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return false;
++  if (h === '::1' || h === '0.0.0.0') return false;
++  if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h)) return false;
++  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
++  if (/^169\.254\./.test(h)) return false;
++  return true;
++}
++
++/** HEAD 粗筛；HEAD 不被支持时退回带 Range 的 GET。 */
++export async function headCheck(fetchImpl, url, { maxBytes = DEFAULT_MAX_BYTES } = {}) {
++  if (!isPublicHttpUrl(url)) return { ok: false, reason: '不是公网 http(s) 地址' };
++  const opts = { headers: { 'User-Agent': UA, accept: 'image/*' }, signal: AbortSignal.timeout(15_000) };
++  let res = null;
++  let err = '';
++  try {
++    res = await fetchImpl(url, { ...opts, method: 'HEAD' });
++  } catch (e) { err = String(e?.message ?? e); }
++  if (!res || res.status >= 400) {
++    try {
++      res = await fetchImpl(url, { headers: { ...opts.headers, range: 'bytes=0-1023' }, signal: AbortSignal.timeout(15_000) });
++    } catch (e) { err = String(e?.message ?? e); }
++  }
++  if (!res) return { ok: false, reason: `请求失败${err ? '（' + err + '）' : ''}` };
++  if (res.status >= 400) return { ok: false, reason: `HTTP ${res.status}` };
++  const mime = String(res.headers.get('content-type') || '').toLowerCase();
++  if (!IMAGE_MIME.test(mime)) return { ok: false, reason: `不是图片（${mime || '未知类型'}）` };
++  const len = Number(res.headers.get('content-length') || 0);
++  if (len && len > maxBytes) return { ok: false, reason: `太大（${Math.round(len / 1048576)}MB）` };
++  return { ok: true, mime, bytes: len || null };
++}
++
++/** 完整下载、复核并算 sha256。 */
++export async function downloadHash(fetchImpl, url, { maxBytes = DEFAULT_MAX_BYTES } = {}) {
++  if (!isPublicHttpUrl(url)) return { ok: false, reason: '不是公网 http(s) 地址' };
++  let res;
++  try {
++    res = await fetchImpl(url, {
++      headers: { 'User-Agent': UA, accept: 'image/*' },
++      signal: AbortSignal.timeout(30_000)
++    });
++  } catch (e) {
++    return { ok: false, reason: `下载失败（${String(e?.message ?? e)}）` };
++  }
++  if (!res || res.status >= 400) return { ok: false, reason: `下载失败 HTTP ${res?.status ?? '?'}` };
++  const mime = String(res.headers.get('content-type') || '').toLowerCase();
++  if (!IMAGE_MIME.test(mime)) return { ok: false, reason: `不是图片（${mime || '未知类型'}）` };
++  let buf;
++  try { buf = Buffer.from(await res.arrayBuffer()); } catch (e) {
++    return { ok: false, reason: `读取失败（${String(e?.message ?? e)}）` };
++  }
++  if (!buf.length) return { ok: false, reason: '空文件' };
++  if (buf.length > maxBytes) return { ok: false, reason: `太大（${Math.round(buf.length / 1048576)}MB）` };
++  const hash = crypto.createHash('sha256').update(buf).digest('hex');
++  return { ok: true, hash, bytes: buf.length, mime };
++}
++
++function loadUsed() {
++  try {
++    const raw = JSON.parse(fs.readFileSync(usedFile(), 'utf8'));
++    return raw && typeof raw === 'object' ? raw : {};
++  } catch { return {}; }
++}
++
++function saveUsed(map) {
++  try {
++    const file = usedFile();
++    fs.mkdirSync(path.dirname(file), { recursive: true });
++    const tmp = `${file}.${process.pid}.tmp`;
++    fs.writeFileSync(tmp, JSON.stringify(map), 'utf8');
++    fs.renameSync(tmp, file);
++  } catch { /* 记录失败不影响发帖 */ }
++}
++
++/** 这个哈希最近发过没有。 */
++export function seenRecently(hash, ttlMs = USED_TTL_MS) {
++  if (!hash) return false;
++  const map = loadUsed();
++  const at = Number(map[hash]?.at) || 0;
++  if (!at) return false;
++  if (Date.now() - at > ttlMs) return false;
++  return true;
++}
++
++/** 发成功后记一笔。顺带清掉过期项，文件不会无限长。 */
++export function remember(hash, url = '') {
++  if (!hash) return;
++  const map = loadUsed();
++  const now = Date.now();
++  for (const [k, v] of Object.entries(map)) {
++    if (now - (Number(v?.at) || 0) > USED_TTL_MS) delete map[k];
++  }
++  map[hash] = { at: now, url: String(url || '').slice(0, 300) };
++  saveUsed(map);
++}
