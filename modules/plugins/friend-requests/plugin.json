@@ -1,0 +1,47 @@
+{
+  "id": "friend-requests",
+  "name": "好友申请通知",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "entry": "index.js",
+  "description": "有人加好友或有入群邀请时，把「谁、理由、编号」推到主人私聊；主人回「同意 3 / 拒绝 3」即可处理。不自动同意。",
+  "author": "本地定制",
+  "enabledByDefault": true,
+  "capabilities": [],
+  "requires": [],
+  "settings": {
+    "enabled": true,
+    "ownerIds": "10001",
+    "notify": true,
+    "ttlMinutes": 30,
+    "maxRecords": 50
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用好友申请通知",
+      "description": "关掉后不记录、不通知。"
+    },
+    "ownerIds": {
+      "type": "string",
+      "label": "主人 QQ 号",
+      "description": "多个用逗号分隔。只有这些号能查看和处理申请。"
+    },
+    "notify": {
+      "type": "boolean",
+      "label": "推送到主人私聊",
+      "description": "默认开。关掉后只记录，不打扰。"
+    },
+    "ttlMinutes": {
+      "type": "number",
+      "label": "有效期（分钟）",
+      "description": "QQ 的申请 flag 有时效，默认 30 分钟；超时后批准可能失败。"
+    },
+    "maxRecords": {
+      "type": "number",
+      "label": "最多保留记录",
+      "description": "默认 50 条，超出丢弃最旧的。"
+    }
+  }
+}

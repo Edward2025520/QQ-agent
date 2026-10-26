@@ -16,6 +16,7 @@
 | --- | --- | --- |
 | `plugins/shared-memory` | 插件（hooks） | 每轮把最近 N 小时**其它会话**的摘要压成一小段注入提示词；另注册 `shared-memory__recall` 工具，可在保留期内跨会话检索 |
 | `plugins/pinned-facts` | 插件（hooks） | 把长期不变的事实（谁是谁、别名、主人口径）每轮注入，不受记忆整理影响；号码类信息只在白名单私聊给出 |
+| `plugins/friend-requests` | 插件（hooks + 工具） | 有人加好友/入群邀请时通知主人，回一个数字即可批准；不自动同意 |
 | `plugins/dm-notice` | 插件（hooks） | 好友回消息后，把「对方说了什么 + 机器人回了什么」合并成一条，推到主人私聊 |
 | `skills/friend-dm` | 技能（工具） | 让机器人在主人明确下命令时给名单里的好友发私聊；带名单白名单、静默时段、每日上限 |
 | `scripts/qq-agent-retention` | 脚本 + systemd timer | 每天 04:00 按保留期清理聊天记录、群友印象、会话片段、对话会话，软删除到备份区 |
