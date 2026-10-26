@@ -14,7 +14,7 @@
 {
   "ownerQq": "10001",
   "facts": [
-    "老大就是坑位，也叫 Kengway，是同一个人。",
+    "老大就是「示例昵称」，也叫 ExampleName，是同一个人。",
     "老大的 QQ 号是 {{ownerQq}}，认人只认这个号。",
     "转达目标：private:{{ownerQq}}"
   ]
