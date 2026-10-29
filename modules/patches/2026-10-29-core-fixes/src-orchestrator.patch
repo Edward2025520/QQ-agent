@@ -1,0 +1,31 @@
+--- a/src/orchestrator.js
++++ b/src/orchestrator.js
+@@ -1303,7 +1303,18 @@
+       if (this.aborted) return;
+       try {
+         const dueList = this.reminders.due(Date.now());
++        // 到点时正好离线（重启/断网）的提醒不补发：超过 staleMinutes 直接作废，
++        // 免得"早上七点叫人"变成"下午三点才叫"。阈值 config.reminders.staleMinutes，默认 30。
++        const staleMinutes = Math.max(1, Number(getConfig().reminders?.staleMinutes) || 30);
++        const staleMs = staleMinutes * 60000;
+         for (const r of dueList) {
++          if (Date.now() - (Number(r.dueAt) || 0) > staleMs) {
++            this.reminders.markFired(r.id);
++            console.warn(`[reminder] 过期作废：${r.chatKey} 逾期 ${Math.round((Date.now() - r.dueAt) / 60000)} 分钟`);
++          }
++        }
++        const freshDue = dueList.filter((r) => Date.now() - (Number(r.dueAt) || 0) <= staleMs);
++        for (const r of freshDue) {
+           if (this.reminderFiring.has(r.id)) continue;
+           this.reminderFiring.add(r.id);
+           try {
+@@ -1334,7 +1345,8 @@
+   async #fireReminder(r) {
+     const [kind, id] = String(r.chatKey || '').split(':');
+     if (!kind || !id) return;
+-    const text = `⏰ 提醒：${r.text}`;
++    const text = String(r.text || '').trim();
++    if (!text) return;
+     // 走统一发送管道（SendQueue）：与机器人发言共享限频 / 去重 / 超长切分 / CQ 转义，
+     // 并自带留档（appendSelf）。原先直接调 onebot.sendText 会绕过这四项 ——
+     // 表现为提醒与正常发言并发抢发、限频计数不到它、超长提醒被协议端截断。

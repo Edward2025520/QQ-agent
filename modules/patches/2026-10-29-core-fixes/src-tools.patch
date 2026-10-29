@@ -1,0 +1,112 @@
+--- a/src/tools.js
++++ b/src/tools.js
+@@ -67,6 +67,24 @@
+  * 其余仍是 image_url。GIF 按原图（gif-image 路线）发送时：能读 GIF 的模型
+  * 看得到动图，读不了的会在网关报错后由 image-compat 的降级路径换首帧重试。
+  */
++/**
++ * QQ 图片链接有时效（rkey 会过期），消息里存下来的 url 过一会儿就返回 400。
++ * 这时用协议端的 get_image 按 file 重新取一次地址 —— 实测同一文件能拿到有效链接。
++ * 返回新的 url；拿不到就返回空串。
++ */
++async function refreshImageUrl(onebot, file) {
++  if (!onebot || typeof onebot.call !== 'function' || !file) return '';
++  try {
++    const data = await onebot.call('get_image', { file });
++    const url = String(data?.file || data?.url || '');
++    if (url) console.log('[image] 链接过期，已用 get_image 刷新');
++    return url;
++  } catch (error) {
++    console.warn('[image] get_image 刷新失败:', error?.message ?? error);
++    return '';
++  }
++}
++
+ function getImagePartsOrVideo(text, results) {
+   const parts = [{ type: 'text', text }];
+   const gifAsImage = [];
+@@ -159,7 +177,7 @@
+   registerTool({
+     id: 'send_message',
+     name: '发送消息',
+-    description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊；要发到别处用 send_to）。messages 传字符串=发一条；传字符串数组=分多条发送（推荐，更像真人）。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',
++    description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊；要发到别处用 send_to）。messages 传字符串=发一条（默认就用这个，一条说完）；传字符串数组=分多条发送，只有确实要隔开说几件事时才用，不要为了"像真人"把一句话拆成两条。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',
+     category: 'messaging',
+     icon: '💬',
+     parameters: {
+@@ -621,12 +639,25 @@
+       try {
+         const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
+         if (!entry) return err(`当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
+-        const urls = (entry.media || []).filter((m) => m.kind === 'image' && m.url).map((m) => m.url);
+-        if (!urls.length) return ok(`消息 ${args.messageId} 没有可查看的图片`);
++        const mediaList = (entry.media || []).filter((m) => m.kind === 'image' && (m.url || m.file));
++        if (!mediaList.length) return ok(`消息 ${args.messageId} 没有可查看的图片`);
+         const results = [];
+         const failed = [];
+-        for (const url of urls) {
+-          try { results.push(await downloadImageAsDataUrl(url)); } catch (e) { failed.push(String(e?.message ?? e)); }
++        for (const media of mediaList) {
++          let got = null;
++          if (media.url) {
++            try { got = await downloadImageAsDataUrl(media.url); } catch (e) { failed.push(String(e?.message ?? e)); }
++          }
++          // 链接过期（HTTP 400）或压根没 url：用 file 让协议端重新给一次地址
++          if (!got && media.file) {
++            const fresh = await refreshImageUrl(ctx.onebot, media.file);
++            if (fresh) {
++              try { got = await downloadImageAsDataUrl(fresh); } catch (e) { failed.push(String(e?.message ?? e)); }
++            } else {
++              failed.push('链接已过期，协议端也没能重新取到');
++            }
++          }
++          if (got) results.push(got);
+         }
+         if (!results.length) return err(`图片获取失败：${failed.join('；')}`);
+         const note = failed.length ? `（另有 ${failed.length} 张获取失败）` : '';
+@@ -827,7 +858,7 @@
+   registerTool({
+     id: 'set_reminder',
+     name: '设置提醒',
+-    description: '设置一个定时提醒（闹钟）。到点后机器人会在当前群里主动发一条提醒消息。适用：群友说"X分钟后提醒我"、"明天早上叫我"、"X点提醒我吃饭"。delayMinutes（多少分钟后）和 atTime（具体时间，如"18:30"或"2026-09-12 08:00"）二选一。',
++    description: '设置一个定时提醒（闹钟）。到点后机器人会在目标会话主动发一句（原话，不加前缀）。默认发在当前会话；主人可用 targetChatKey 指定发给谁（比如"明早七点叫 yy"）。适用：群友说"X分钟后提醒我"、"明天早上叫我"、"X点提醒我吃饭"。delayMinutes（多少分钟后）和 atTime（具体时间，如"18:30"或"2026-09-12 08:00"）二选一。',
+     category: 'system',
+     icon: '⏰',
+     parameters: {
+@@ -835,7 +866,8 @@
+       properties: {
+         text: { type: 'string', description: '提醒内容（到点要发的话，如"该吃饭了"、"你让提醒你的：开会"）' },
+         delayMinutes: { type: 'number', description: '多少分钟后提醒（与 atTime 二选一）' },
+-        atTime: { type: 'string', description: '具体时间提醒，格式 "HH:MM"（今天/明天）或 "YYYY-MM-DD HH:MM"（与 delayMinutes 二选一）' }
++        atTime: { type: 'string', description: '具体时间提醒，格式 "HH:MM"（今天/明天）或 "YYYY-MM-DD HH:MM"（与 delayMinutes 二选一）' },
++        targetChatKey: { type: 'string', description: '可选：要发到哪个会话（group:群号 / private:QQ号）。不传就是当前会话；主人可以用它给别人设提醒，目标必须在白名单内。' }
+       },
+       required: ['text']
+     },
+@@ -853,10 +885,24 @@
+         return err('请提供 delayMinutes（多少分钟后）或 atTime（具体时间）之一');
+       }
+       if (!ctx.reminders) return err('提醒服务未启用');
+-      const entry = ctx.reminders.add({ chatKey: ctx.chatKey, text, dueAt, createdBy: String(ctx.selfId || '') });
++      // 目标会话：默认当前会话；传了就用传的，并且必须过白名单（否则等于给任意号发消息）。
++      const wantTarget = String(args.targetChatKey ?? '').trim() || ctx.chatKey;
++      if (!/^(group|private):\d+$/.test(wantTarget)) {
++        return err('targetChatKey 格式应为 group:群号 或 private:QQ号');
++      }
++      if (wantTarget !== ctx.chatKey) {
++        const allow = getConfig().allow || {};
++        const [tKind, tId] = wantTarget.split(':');
++        const list = (tKind === 'group' ? allow.groups : allow.private) || [];
++        if (!list.map(String).includes(tId)) {
++          return err(`目标 ${wantTarget} 不在白名单内，不能给它设提醒。`);
++        }
++      }
++      const entry = ctx.reminders.add({ chatKey: wantTarget, text, dueAt, createdBy: String(ctx.selfId || '') });
+       const when = new Date(dueAt);
+       const whenStr = `${when.getMonth() + 1}月${when.getDate()}日 ${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
+-      return ok({ set: true, id: entry.id, dueAt, note: `已设置提醒：${whenStr} 到点我会在本群说「${text}」。` });
++      const where = wantTarget === ctx.chatKey ? '本会话' : wantTarget;
++      return ok({ set: true, id: entry.id, dueAt, targetChatKey: wantTarget, note: `已设置提醒：${whenStr} 到点我会在${where}说「${text}」。` });
+     }
+   });
+ 

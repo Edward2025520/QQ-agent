@@ -1,0 +1,26 @@
+--- a/src/app.js
++++ b/src/app.js
+@@ -1035,6 +1035,10 @@
+ 
+   async function handleOneBotEvent(event) {
+     if (!event || typeof event !== 'object') return;
++    // 诊断用：记录每一个到达的事件类型，默认关闭（config.debug.events=true 才打）。
++    if (getConfig()?.debug?.events === true) {
++      log(`[event] post_type=${event.post_type} request_type=${event.request_type ?? '-'} user=${event.user_id ?? '-'} group=${event.group_id ?? '-'} sub=${event.sub_type ?? '-'}`);
++    }
+     if (event.post_type === 'message' || event.post_type === 'message_sent') {
+       // 自己发的消息（message_sent / self_id 相同）不触发处理（发送时已自行记录）
+       if (String(event.user_id ?? event.sender?.user_id ?? '') === onebot.selfId) return;
+@@ -1059,9 +1063,10 @@
+       return handleGroupBan(event);
+     }
+     // 好友/入群请求：OneBot 的 post_type=request。
+-    // 插件注册的 friend.request / group.request 钩子此前从未被触发 ——
+-    // 请求事件在这里就被丢掉了，插件里那套处理逻辑等于死代码。
++    // share-card 的 friend.request / group.request 钩子此前从未被触发 ——
++    // 请求事件在这里就被丢掉了，插件里那套自动同意/通知逻辑等于死代码。
+     if (event.post_type === 'request') {
++      log(`[request] 收到 ${event.request_type} 请求 user=${event.user_id ?? '-'} group=${event.group_id ?? '-'} flag=${String(event.flag ?? '').slice(0, 12)}…`);
+       const kind = event.request_type === 'friend' ? 'friend'
+         : (event.request_type === 'group' ? 'group' : null);
+       if (!kind) return;

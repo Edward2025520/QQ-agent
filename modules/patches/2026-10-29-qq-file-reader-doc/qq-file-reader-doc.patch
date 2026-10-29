@@ -1,0 +1,98 @@
+--- a/skills/qq-file-reader/index.js
++++ b/skills/qq-file-reader/index.js
+@@ -23,7 +23,8 @@
+   '.c', '.cpp', '.h', '.hpp', '.xml', '.yml', '.yaml', '.html', '.css',
+   '.sql', '.ini', '.conf', '.bat', '.ps1', '.sh'
+ ]);
+-const DOC_EXTS = new Set(['.pdf', '.docx', '.xlsx', '.pptx']);
++const DOC_EXTS = new Set(['.pdf', '.docx', '.xlsx', '.pptx', '.doc', '.rtf', '.wps']);
++const LEGACY_EXTS = new Set(['.doc', '.rtf', '.wps']);
+ const ALL_EXTS = new Set([...TEXT_EXTS, ...DOC_EXTS]);
+ 
+ let settingsFn = () => ({});
+@@ -84,6 +85,55 @@
+ }
+ 
+ /** 调本机 Python 抽文本。失败抛出带人话的错误。 */
++/** 跑一个外部命令，带超时；永不 reject，返回 {ok,out,err}。 */
++function runBin(cmd, args, timeoutMs) {
++  return new Promise((resolve) => {
++    let child;
++    try {
++      child = spawn(cmd, args, { windowsHide: true });
++    } catch (error) {
++      resolve({ ok: false, out: '', err: String(error?.message ?? error) });
++      return;
++    }
++    let out = '';
++    let err = '';
++    const timer = setTimeout(() => {
++      try { child.kill(); } catch { /* ignore */ }
++      resolve({ ok: false, out, err: 'timeout' });
++    }, timeoutMs);
++    child.stdout?.on('data', (d) => { out += String(d); });
++    child.stderr?.on('data', (d) => { err += String(d); });
++    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, out, err: String(e?.message ?? e) }); });
++    child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, out, err }); });
++  });
++}
++
++/**
++ * 老的 .doc/.rtf/.wps 先转成 docx 再走 extract()，保留表格结构；
++ * LibreOffice 不可用或超时 → 退 antiword 出纯文本；再不行给明确建议。
++ */
++async function convertLegacy(file, ext) {
++  const dir = path.dirname(file);
++  const profile = path.join(TMP_DIR, `lo-profile-${process.pid}-${Date.now()}`);
++  const res = await runBin('soffice', [
++    '--headless', '--norestore', '--nolockcheck', '--nodefault', '--nofirststartwizard',
++    `-env:UserInstallation=file://${profile}`,
++    '--convert-to', 'docx', '--outdir', dir, file
++  ], 45_000);
++  try { fs.rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
++
++  const out = path.join(dir, `${path.basename(file, ext)}.docx`);
++  if (res.ok && fs.existsSync(out)) return out;
++
++  const aw = await runBin('antiword', [file], 20_000);
++  if (aw.ok && aw.out.trim()) {
++    const txt = `${file}.txt`;
++    fs.writeFileSync(txt, aw.out, 'utf8');
++    return txt;
++  }
++  throw new Error('这份文件转不出来（可能已损坏，或是图片版文档）。存成 docx 再发我，或者把内容贴过来');
++}
++
+ function extract(file, pythonPath) {
+   return new Promise((resolve, reject) => {
+     const script = path.join(SKILL_DIR, 'extract.py');
+@@ -159,7 +209,13 @@
+   try {
+     const { safeFetchBinaryToFile } = await safeFetchModule();
+     await safeFetchBinaryToFile(media.url, tmp, conf.maxBytes, { timeoutMs: 30_000 });
+-    const text = TEXT_EXTS.has(ext) ? readTextFile(tmp) : await extract(tmp, conf.pythonPath);
++    const target = LEGACY_EXTS.has(ext) ? await convertLegacy(tmp, ext) : tmp;
++    let text;
++    try {
++      text = TEXT_EXTS.has(ext) ? readTextFile(target) : await extract(target, conf.pythonPath);
++    } finally {
++      if (target !== tmp) { try { fs.rmSync(target, { force: true }); } catch { /* ignore */ } }
++    }
+     const clipped = clamp(text, conf.maxChars);
+     return ok({
+       ok: true,
+@@ -198,7 +254,13 @@
+   if (size > conf.maxBytes) return fail(`文件 ${(size / 1048576).toFixed(1)}MB，超过上限`);
+ 
+   try {
+-    const text = TEXT_EXTS.has(ext) ? readTextFile(abs) : await extract(abs, conf.pythonPath);
++    const target = LEGACY_EXTS.has(ext) ? await convertLegacy(abs, ext) : abs;
++    let text;
++    try {
++      text = TEXT_EXTS.has(ext) ? readTextFile(target) : await extract(target, conf.pythonPath);
++    } finally {
++      if (target !== abs) { try { fs.rmSync(target, { force: true }); } catch { /* ignore */ } }
++    }
+     const clipped = clamp(text, conf.maxChars);
+     return ok({
+       ok: true,
