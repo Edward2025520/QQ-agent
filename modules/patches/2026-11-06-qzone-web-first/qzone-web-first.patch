@@ -1,0 +1,83 @@
+diff -ruN a/skills/qzone/index.js b/skills/qzone/index.js
+--- a/skills/qzone/index.js	2026-11-06 23:12:36.007026200 +0800
++++ b/skills/qzone/index.js	2026-11-06 23:12:37.074028300 +0800
+@@ -202,8 +202,8 @@
+     id: 'pick_qzone_meme',
+     name: '找配图表情包',
+     // ★ 本机补丁 2026-10-17：现在有两个图源，说明里必须讲清楚（否则模型不知道能搜网图）
+-    description: '从**两个图源**找配图：① DeepSeek娘图库（风格统一，每张有「图上台词」和「内容描述」）；'
+-      + '② **memecub（专为 AI 做的表情包搜索引擎）**——自带标签（哈基米/奶龙/吗喽/熊猫头…），'
++    description: '**先搜网图，网图没合适的再退本地图库**：① **memecub（专为 AI 做的表情包搜索引擎）**——默认先搜它，自带标签（哈基米/奶龙/吗喽/熊猫头…）；'
++      + '② DeepSeek娘图库（风格统一，每张有「图上台词」和「内容描述」）——网图一个都不搭时才用；'
+       + '色情/政治人物等由它自己过滤掉，标题和尺寸都是现成的。'
+       + '⚠️ **没有候选就直接不配图**：纯文字说说完全正常，硬配一张不搭的图比不配更糟。'
+       + '默认两个图源都给候选（source=auto）；只想用图库传 source=gallery，只想用网图传 source=web。'
+@@ -223,7 +223,7 @@
+         category: { type: 'string', description: '按图库分类筛选（基本都是 DeepSeek娘）' },
+         limit: { type: 'integer', description: '返回几个候选，默认 6。**只看一张就够，不要一次挑好几张**。' },
+         // ★ 本机补丁 2026-10-17
+-        source: { type: 'string', description: '图源：auto（默认，图库为主、网图补充）| gallery（只用 DeepSeek娘图库）| web（只用网图）', enum: ['auto', 'gallery', 'web'] }
++        source: { type: 'string', description: '图源：auto（默认，网图优先、图库兜底）| web（只用网图）| gallery（只用本地图库）', enum: ['auto', 'gallery', 'web'] }
+       }
+     },
+     async execute(ctx, args) {
+@@ -260,7 +260,7 @@
+               const c = await cacheWebImage(fetchImpl, x.url, cacheDir);
+               if (c.hash && seenRecently(c.hash)) { skipped.push(x.desc.slice(0, 12) + '（最近发过）'); continue; }
+               items.push({
+-                来源: (x.origin === 'baidu' ? '网图（百度图片）' : '网图（必应图片）'),
++                来源: '网图（memecub）',
+                 内容描述: x.desc + '（' + c.size.w + '×' + c.size.h + '）',
+                 url: x.url
+               });
+@@ -270,6 +270,27 @@
+           }
+           return { items, error: '', skipped };
+         };
++        // ★ 2026-11-06：配图先搜网图，网图没有合适的再退本地图库（用户定稿）。
++        const sourceWant = String(args.source || 'auto');
++        if (keyword && sourceWant !== 'gallery' && rules().webMemecub === 1) {
++          const first = await webPick(keyword, Math.min(14, limit * 2));
++          const cdNow = rules().memeCooldownDays;
++          const usedNow = cdNow > 0 ? state.recentImages(cdNow) : new Set();
++          const freshWeb = (first.items || []).filter((e) => !usedNow.has(String(e.url || '')));
++          if (freshWeb.length) {
++            return ok({
++              found: true,
++              matchedKeyword: true,
++              keyword,
++              source: 'web',
++              candidates: freshWeb,
++              note: '这些是从**网图（memecub）**搜到的候选，每条带标题和尺寸——按「内容描述」挑一张真正贴合这条说说的。'
++                + '都不搭就换个关键词再搜一次，或者直接发纯文字；本地图库只在前面的候选一个都不合适时才考虑。'
++                + (first.skipped?.length ? `（另有 ${first.skipped.length} 张因尺寸/长宽比/重复被剔除）` : '')
++            });
++          }
++        }
++
+         const r = await pickMemes(fetchImpl, {
+           keyword,
+           category: String(args.category || ''),
+@@ -356,11 +377,8 @@
+           });
+         }
+ 
+-        // ★ 本机补丁 2026-10-17：图库命中时，再补一批网图候选 —— 图库 95% 是
+-        //   DeepSeek娘，只给图库等于"配图永远一个样"。source=gallery 可关掉这步。
+-        const wantWeb = rules().webMemeEnabled === 1 && String(args.source || 'auto') !== 'gallery';
+-        const webPickResult = wantWeb ? await webPick(keyword || '', rules().webMemeCount) : { items: [], error: '' };
+-        const webItems = webPickResult.items.filter((e) => !usedImgs.has(String(e.url || '')));
++        // ★ 2026-11-06：网图已在前面优先搜过（有候选就直接返回），这里只走本地图库。
++        const webItems = [];
+ 
+         const fmt = (e) => ({
+           内容描述: e.desc || '（无描述）',
+@@ -817,7 +835,7 @@
+       : '发的话：先调 fetch_qzone_topics 看看网上有什么热点，挑一条你真想吐槽/感慨的，'
+         + '写成你自己的口吻（别写成新闻稿），再调 publish_qzone_post 发出去——可见范围是好友可见，不用你设置。';
+     const nudge = head + howto
+-      + '想配图就先调 pick_qzone_meme，挑一张真搭的；**找不到搭的就别配图**，纯文字同样正常。'
++      + '想配图就先调 pick_qzone_meme（默认先搜网图，网图没合适的才用本地图库），挑一张真搭的；**找不到搭的就别配图**，纯文字同样正常。'
+       // 这段是隐私防线的关键：明确切断"群聊 → 说说"的联想
+       + '**注意：说说的话题只能来自网络热点或你自己的想法，不要写群里刚聊的事、不要提任何群友、不要复述任何人的话。**'
+       + '空间是所有好友可见的，把群聊写进去等于替群友做了公开的决定。'

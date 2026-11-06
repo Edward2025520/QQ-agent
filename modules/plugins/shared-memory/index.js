@@ -76,6 +76,15 @@ function isTrusted(chatKey) {
   return allow.map(String).includes(String(id));
 }
 
+/** 白名单会话（私聊或群）：能看到老大私聊的片段，群里受"不主动提"约束。 */
+function isWhitelisted(chatKey) {
+  const [kind, id] = String(chatKey || '').split(':');
+  const allow = cfg()?.allow || {};
+  if (kind === 'private') return (allow.private || []).map(String).includes(String(id));
+  if (kind === 'group') return (allow.groups || []).map(String).includes(String(id));
+  return false;
+}
+
 const hhmm = (ts) => {
   const d = new Date(Number(ts) || 0);
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -87,7 +96,7 @@ const cut = (s, n) => {
 };
 
 /** 最近 N 小时的自动留档片段（别的会话）。 */
-function recentChunks(hours, chatKey, trusted) {
+function recentChunks(hours, chatKey, allowPrivate) {
   let names = [];
   try { names = fs.readdirSync(CHUNK_DIR).filter((f) => f.endsWith('.json')); } catch { return []; }
   const since = Date.now() - hours * 3600e3;
@@ -99,7 +108,7 @@ function recentChunks(hours, chatKey, trusted) {
       if (!when || when < since) continue;
       const key = String(j?.chatKey || '');
       if (!key || key === chatKey) continue;
-      if (!trusted && key.startsWith('private:')) continue; // 非熟人不看私聊内容
+      if (!allowPrivate && key.startsWith('private:')) continue; // 白名单外不看私聊内容
       const text = cut(j?.summary || j?.title || '', 80);
       if (!text) continue;
       out.push({ chatKey: key, when, text });
@@ -166,14 +175,17 @@ function scrub(text) {
 
 function buildDigest(chatKey, s = settings()) {
   const trusted = isTrusted(chatKey);
+  // 白名单群：能引用老大私聊的片段，但不主动提（只在被直接问到时用）。
+  const semi = !trusted && isWhitelisted(chatKey);
+  const familiar = trusted || semi;
   const lines = [];
-  for (const c of recentChunks(Number(s.hours) || 6, chatKey, trusted)) {
+  for (const c of recentChunks(Number(s.hours) || 6, chatKey, familiar)) {
     lines.push(`· ${chatLabel(c.chatKey)} ${hhmm(c.when)}：${c.text}`);
   }
   for (const m of recentImpressions(Number(s.days) || 7, chatKey)) {
-    if (!trusted && String(m.uid) === ownerQq()) continue; // 非熟人完全不注入主人的印象，避免脱敏后读起来别扭
+    if (!familiar && String(m.uid) === ownerQq()) continue; // 白名单外完全不注入主人的印象，避免脱敏后读起来别扭
     const who = String(m.uid) === ownerQq()
-      ? (trusted ? ownerName() : "老大")
+      ? (familiar ? ownerName() : "老大")
       : `${m.name}(QQ:${m.uid})`;
     lines.push(`· 你对 ${who} 的印象：${m.imps.join('｜')}`);
   }
@@ -183,7 +195,9 @@ function buildDigest(chatKey, s = settings()) {
   const tail = [
     '（这些跨会话的事可以自然用上；7 天前的事已经忘了，别硬编。被问到细节不确定时，先调 shared-memory__recall 再答。）'
   ];
-  if (!trusted) {
+  if (semi) {
+    tail.push('（这是白名单群：别主动提老大私聊的事，只有别人直接问起时才引用；老大的 QQ 号仍然不报。）');
+  } else if (!trusted) {
     tail.push('（对这个人/这个群：不要说出老大的名字或号码，也不要复述任何私聊内容。）');
   }
 
@@ -192,7 +206,7 @@ function buildDigest(chatKey, s = settings()) {
   const kept = [];
   let chars = head.length + tail.join('').length;
   for (const line of lines) {
-    const text = trusted ? scrubQq(line) : scrub(line);
+    const text = familiar ? scrubQq(line) : scrub(line);
     if (kept.length >= maxLines) break;
     if (chars + text.length > maxChars) break;
     kept.push(text);
@@ -225,7 +239,7 @@ async function appendToTail(messages, text) {
 
 // ── 检索 ─────────────────────────────────────────────────────────────────
 
-function searchChunks(query, { days, chatKey, trusted, limit }) {
+function searchChunks(query, { days, chatKey, allowPrivate, limit }) {
   const since = Date.now() - Math.max(1, days) * 86400e3;
   const terms = String(query || '').toLowerCase().split(/[\s,，。？?！!、；;：:]+/).filter((t) => t.length >= 1);
   let names = [];
@@ -237,7 +251,7 @@ function searchChunks(query, { days, chatKey, trusted, limit }) {
       const when = Number(j?.when) || 0;
       if (!when || when < since) continue;
       const key = String(j?.chatKey || '');
-      if (!trusted && key.startsWith('private:')) continue;
+      if (!allowPrivate && key.startsWith('private:')) continue;
       const hay = [
         j?.title, j?.summary, ...(Array.isArray(j?.keywords) ? j.keywords : []),
         ...(Array.isArray(j?.snippets) ? j.snippets.map((x) => x?.text || '') : [])
@@ -323,17 +337,18 @@ function registerRecallTool(a) {
         const s = settings();
         const chatKey = String(ctx?.chatKey || '');
         const trusted = isTrusted(chatKey);
+        const known = trusted || isWhitelisted(chatKey);
         const days = Math.min(Number(s.days) || 7, Math.max(1, Number(args?.days) || 7));
         const limit = Math.max(1, Math.min(10, Number(args?.limit) || 5));
         const query = String(args?.query ?? '').trim();
         if (!query) return { content: '请给一个关键词。', isError: true };
-        const hits = searchChunks(query, { days, chatKey, trusted, limit });
+        const hits = searchChunks(query, { days, chatKey, allowPrivate: known, limit });
         if (!hits.length) {
           return { content: `最近 ${days} 天没有和「${query}」相关的留档。` };
         }
         const lines = hits.map((h) => {
           const t = `${chatLabel(h.chatKey)} ${hhmm(h.when)}：${h.text}`;
-          return `· ${trusted ? t : scrub(t)}`;
+          return `· ${known ? t : scrub(t)}`;
         });
         let text = `【跨会话检索 · 关键词「${query}」】\n${lines.join('\n')}`;
         const max = Math.max(200, Number(s.maxRecallChars) || 3000);
