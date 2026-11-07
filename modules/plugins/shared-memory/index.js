@@ -189,17 +189,18 @@ function buildDigest(chatKey, s = settings()) {
       : `${m.name}(QQ:${m.uid})`;
     lines.push(`· 你对 ${who} 的印象：${m.imps.join('｜')}`);
   }
-  if (!lines.length) return { text: '', lines: 0, trusted };
+  const tier = trusted
+    ? '（这个人在白名单里：老大跟你聊过的事，被问到可以承认、可以复述具体内容和原话，也可以主动提；只有 QQ 号不报，也不代转聊天记录文件。）'
+    : (semi
+      ? '（这是白名单群：别主动提老大私聊的事，只有别人直接问起时才引用；老大的 QQ 号仍然不报。）'
+      : '（对这个人/这个群：不要说出老大的名字或号码，也不要复述任何私聊内容。）');
+  if (!lines.length) return { text: tier, lines: 0, trusted };
 
   const head = `【共享记忆 · 最近 ${Number(s.hours) || 6} 小时你在别的会话里知道的事】`;
   const tail = [
-    '（这些跨会话的事可以自然用上；7 天前的事已经忘了，别硬编。被问到细节不确定时，先调 shared-memory__recall 再答。）'
+    '（这些跨会话的事可以自然用上；7 天前的事已经忘了，别硬编。被问到细节不确定时，先调 shared-memory__recall 再答。）',
+    tier
   ];
-  if (semi) {
-    tail.push('（这是白名单群：别主动提老大私聊的事，只有别人直接问起时才引用；老大的 QQ 号仍然不报。）');
-  } else if (!trusted) {
-    tail.push('（对这个人/这个群：不要说出老大的名字或号码，也不要复述任何私聊内容。）');
-  }
 
   const maxLines = Math.max(1, Number(s.maxLines) || 12);
   const maxChars = Math.max(100, Number(s.maxChars) || 900);
@@ -212,7 +213,7 @@ function buildDigest(chatKey, s = settings()) {
     kept.push(text);
     chars += text.length;
   }
-  if (!kept.length) return { text: '', lines: 0, trusted };
+  if (!kept.length) return { text: tier, lines: 0, trusted };
   return { text: [head, ...kept, ...tail].join('\n'), lines: kept.length, trusted };
 }
 
@@ -373,6 +374,7 @@ export const providers = {
       ok: true,
       chatKey,
       trusted: d.trusted,
+      semi: !d.trusted && isWhitelisted(chatKey),
       lines: d.lines,
       chars: d.text.length,
       text: d.text
