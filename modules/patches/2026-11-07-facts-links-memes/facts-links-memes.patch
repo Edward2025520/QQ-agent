@@ -1,0 +1,491 @@
+diff -ruN a/skills/whale-memes/index.js b/skills/whale-memes/index.js
+--- a/skills/whale-memes/index.js	2026-11-07 21:14:18.131278400 +0800
++++ b/skills/whale-memes/index.js	2026-11-07 21:14:18.943277300 +0800
+@@ -21,9 +21,11 @@
+ //   · 缓存与状态一律落在 DATA_DIR/whale-memes/ 下，绝不能用 process.cwd() 当锚点。
+ 
+ import fs from 'node:fs';
++import crypto from 'node:crypto';
+ import path from 'node:path';
+ import { DATA_DIR } from '../../src/config.js';
+ import { getSkillConfig } from '../../src/skills/config.js';
++import { searchImages } from '../../src/web-search.js';
+ 
+ const SKILL_ID = 'whale-memes';
+ const SITE = 'https://aigengtu.com';
+@@ -41,7 +43,8 @@
+   dedupe: true,
+   preferOriginal: true,
+   minShortSide: 200,
+-  refreshHours: 12
++  refreshHours: 12,
++  webFirst: true
+ };
+ 
+ const DIR = path.join(DATA_DIR, SKILL_ID);
+@@ -408,12 +411,30 @@
+   return { perHour, perDay, usedHour, usedDay, leftHour, leftDay, left: Math.min(leftHour, leftDay) };
+ }
+ 
+-function recordSent(chatKey, item) {
++function sha1(buf) {
++  return crypto.createHash('sha1').update(buf).digest('hex');
++}
++
++function recordSent(chatKey, item, hash) {
+   const s = stateRead();
+-  s.sent.push({ ts: Date.now(), day: dayKey(), chatKey, id: item.id, name: clean(item.caption || item.name, 40) });
++  s.sent.push({
++    ts: Date.now(),
++    day: dayKey(),
++    chatKey,
++    id: item.id,
++    name: clean(item.caption || item.name, 40),
++    source: item.source || 'gallery',
++    hash: String(hash || item.hash || '')
++  });
+   stateWrite(s);
+ }
+ 
++/** 同一会话里有没有发过同一张图（按内容哈希，跨来源也认）。 */
++function seenHash(chatKey, hash) {
++  if (!hash) return false;
++  return sentIn(stateRead(), chatKey).some((x) => x && x.hash === hash);
++}
++
+ // ─────────────────────────────────────────────── 选图
+ /**
+  * 从图库里挑候选（新→旧按贴合度排序）。
+@@ -563,6 +584,12 @@
+     }
+     if (!ok) continue;
+ 
++    const hash = sha1(ok.buf);
++    if (conf.dedupe !== false && seenHash(ctx.chatKey, hash)) {
++      errors.push(`${item.id} 这张之前发过（内容相同），换下一张`);
++      continue;
++    }
++
+     let file;
+     try {
+       file = saveTmp(ok.buf, ok.format);
+@@ -574,7 +601,7 @@
+     try {
+       await ctx.sender.sendImage(ctx.chatKey, { file }, { note: why || `${SITE_NAME}表情包` });
+       sent.push({ item, ...ok });
+-      recordSent(ctx.chatKey, item);
++      recordSent(ctx.chatKey, item, hash);
+       log(`已发送 ${item.id}（${ok.w}x${ok.h} ${ok.format} ${ok.via}，${Math.round(ok.bytes / 1024)}KB）`);
+     } catch (e) {
+       errors.push(`发送失败：${String(e?.message ?? e).slice(0, 80)}`);
+@@ -630,6 +657,41 @@
+     return { content: `错误：${whyQ}，先不发了（等一会儿再说）。这一轮不要重试。`, isError: true };
+   }
+ 
++  // 网图优先：先用关键词搜网图，能发就不动本地图库（2026-11-07 定稿）。
++  if (!pick && keyword && conf.webFirst !== false) {
++    try {
++      const list = await searchImages(keyword + ' 表情包', { limit: Math.min(12, want * 4) });
++      const items = (Array.isArray(list) ? list : [])
++        .filter((x) => /^https?:\/\//i.test(String(x?.url || '')))
++        .map((x) => ({
++          id: 'web:' + sha1(Buffer.from(String(x.url))).slice(0, 16),
++          url: String(x.url),
++          preview: '',
++          caption: '网图·' + keyword,
++          character: '网图',
++          source: 'web'
++        }));
++      if (items.length) {
++        const w = await sendItems(ctx, items, { want: Math.min(want, quota.left), keyword, why: why || SITE_NAME + '网图' });
++        if (w.sent.length) {
++          noteToSession(ctx, w.sent);
++          const head = w.sent.map((x) => '- 网图 ' + x.w + 'x' + x.h + ' ' + x.format);
++          const after = quotaOf(stateRead(), ctx.chatKey);
++          return {
++            content: [
++              '先从网上搜到并发出 ' + w.sent.length + ' 张（关键词：' + keyword + '）：',
++              ...head,
++              '本会话今天还剩 ' + after.leftDay + ' 张额度。',
++              '接下来：不要在回复里描述图里画的是什么；顺着梗说一句就行。'
++            ].join('\n')
++          };
++        }
++      }
++    } catch (e) {
++      log('网图优先失败，回退图库：' + String(e?.message ?? e));
++    }
++  }
++
+   let cat;
+   try {
+     cat = await loadCatalog();
+@@ -819,6 +881,28 @@
+     }
+   });
+ 
++  api.registerTool({
++    id: 'recent_sent',
++    name: '最近发过的图',
++    description: '查这个会话最近发过哪些表情包（时间、来源、说明）。被问「你上次发的是哪张」「是不是发重了」时用它，别凭记忆答。',
++    category: 'media',
++    icon: '🕘',
++    parameters: {
++      type: 'object',
++      properties: { limit: { type: 'integer', description: '看最近几条，默认 5' } }
++    },
++    async execute(ctx, args) {
++      const limit = clamp(args?.limit ?? 5, 1, 20);
++      const mine = sentIn(stateRead(), ctx?.chatKey || '').slice(-limit).reverse();
++      if (!mine.length) return { content: '这个会话最近没发过表情包。' };
++      const lines = mine.map((x) => {
++        const t = new Date(num(x.ts, 0)).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
++        return '- ' + t + '｜' + (x.source === 'web' ? '网图' : '图库') + '｜' + (x.name || x.id);
++      });
++      return { content: ['这个会话最近发过的：', ...lines].join('\n') };
++    }
++  });
++
+   api.registerTool({
+     id: 'list_memes',
+     name: '翻梗鲸图库',
+diff -ruN a/skills/whale-memes/skill.json b/skills/whale-memes/skill.json
+--- a/skills/whale-memes/skill.json	2026-11-07 21:14:19.692186500 +0800
++++ b/skills/whale-memes/skill.json	2026-11-07 21:14:20.475065700 +0800
+@@ -7,7 +7,9 @@
+   "description": "让机器人从「梗鲸」（aigengtu.com）挑一张贴切的表情包发到当前会话：既能在自己这句话有情绪时主动配一张，也能由群友点名要图（可按关键词或角色挑）。图库是纯静态 JSON，免 Key、免配置，收录 1429 张蓝色大肥鱼（DeepSeek 鲸娘）与各路 AI 娘化梗图。发送前会先把原图下载下来校验真伪（这个图床在图不存在时返回的是 HTML 错误页，不校验就会发出裂图），并且同一个会话里不会重发同一张。",
+   "author": "本地自建",
+   "enabledByDefault": true,
+-  "permissions": ["web_fetch"],
++  "permissions": [
++    "web_fetch"
++  ],
+   "settings": {
+     "enabled": true,
+     "proactive": true,
+@@ -18,7 +20,12 @@
+     "dedupe": true,
+     "preferOriginal": true,
+     "minShortSide": 200,
+-    "refreshHours": 12
++    "refreshHours": 12,
++    "webFirst": {
++      "type": "boolean",
++      "default": true,
++      "description": "发图前先用关键词搜网图，搜不到合适的再退回本地图库"
++    }
+   },
+   "configSchema": {
+     "enabled": {
+@@ -35,7 +42,13 @@
+       "type": "enum",
+       "label": "默认角色",
+       "description": "机器人自己主动配图时优先从哪个角色里挑。auto = 按语气自己决定，不限定角色。（豆大妈 / Kimi娘 / 通义千问娘 / 智谱清言娘 / Gemini娘 / Grok娘 目前图库为空，选了会自动回到 auto。）",
+-      "values": ["auto", "DeepSeek娘", "AI娘化", "Claude娘", "GPT娘"]
++      "values": [
++        "auto",
++        "DeepSeek娘",
++        "AI娘化",
++        "Claude娘",
++        "GPT娘"
++      ]
+     },
+     "maxCount": {
+       "type": "number",
+diff -ruN a/src/link-preview.js b/src/link-preview.js
+--- a/src/link-preview.js	1970-01-01 08:00:00.000000000 +0800
++++ b/src/link-preview.js	2026-11-07 21:14:33.679365200 +0800
+@@ -0,0 +1,166 @@
++// 链接预览：把标题、简介、作者、正文摘要从页面里抽出来。
++//
++// 为什么需要：web_fetch 只会把一整页 HTML 塞给模型，而小红书、抖音、公众号
++// 这类页面正文要登录才给，直接抓只会得到"页面不见了"四个字。这个模块做的事是
++// 尽量把 meta / JSON-LD / 页面内嵌状态里现成的字段捞出来，并在拿不到正文时
++// 明确标 bodyAvailable=false，让模型知道该去搜标题或者跟对方要截图，而不是瞎猜。
++import { safeFetch } from './safe-fetch.js';
++
++const MAX_BYTES = 2_000_000;
++const BODY_LIMIT = 4000;
++
++const PLATFORMS = [
++  [/xiaohongshu\.com|xhslink\.com/i, '小红书'],
++  [/douyin\.com|iesdouyin\.com/i, '抖音'],
++  [/bilibili\.com|b23\.tv/i, 'B站'],
++  [/weibo\.(com|cn)/i, '微博'],
++  [/zhihu\.com/i, '知乎'],
++  [/mp\.weixin\.qq\.com/i, '公众号'],
++  [/youtube\.com|youtu\.be/i, 'YouTube'],
++  [/github\.com/i, 'GitHub']
++];
++
++export function detectPlatform(url) {
++  for (const [re, name] of PLATFORMS) if (re.test(String(url || ''))) return name;
++  return '网页';
++}
++
++function decodeEntities(s) {
++  return String(s ?? '')
++    .replace(/&nbsp;/g, ' ')
++    .replace(/&amp;/g, '&')
++    .replace(/&lt;/g, '<')
++    .replace(/&gt;/g, '>')
++    .replace(/&quot;/g, '"')
++    .replace(/&#39;|&apos;/g, "'")
++    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
++    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)));
++}
++
++function plain(html) {
++  return decodeEntities(
++    String(html ?? '')
++      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
++      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
++      .replace(/<[^>]+>/g, ' ')
++  ).replace(/\s+/g, ' ').trim();
++}
++
++function metaMap(html) {
++  const out = {};
++  for (const m of String(html ?? '').matchAll(/<meta\b[^>]*>/gi)) {
++    const tag = m[0];
++    const key = (tag.match(/(?:property|name)\s*=\s*["']([^"']+)["']/i) || [])[1];
++    const val = (tag.match(/content\s*=\s*["']([^"']*)["']/i) || [])[1];
++    if (key && val) out[key.toLowerCase()] = decodeEntities(val);
++  }
++  return out;
++}
++
++function jsonLd(html) {
++  const found = [];
++  for (const m of String(html ?? '').matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
++    try {
++      const data = JSON.parse(m[1].trim());
++      for (const item of Array.isArray(data) ? data : [data]) if (item && typeof item === 'object') found.push(item);
++    } catch { /* 脏 JSON 跳过 */ }
++  }
++  return found;
++}
++
++/** 页面里内嵌的 desc 字段（小红书笔记、部分站点都有）。 */
++function embeddedDesc(html) {
++  const m = String(html ?? '').match(/"desc"\s*:\s*("(?:[^"\\]|\\.){10,3000}")/);
++  if (!m) return '';
++  try {
++    return plain(JSON.parse(m[1]));
++  } catch {
++    return '';
++  }
++}
++
++function articleBody(html) {
++  const article = String(html ?? '').match(/<article\b[^>]*>([\s\S]{80,20000}?)<\/article>/i);
++  if (article) return plain(article[1]);
++  const wx = String(html ?? '').match(/<div[^>]+id=["']js_content["'][^>]*>([\s\S]{80,20000}?)<\/div>/i);
++  if (wx) return plain(wx[1]);
++  return '';
++}
++
++function tagsOf(text) {
++  const tags = [];
++  for (const m of String(text ?? '').matchAll(/#([^\s#\[\]【】]{1,20})/g)) {
++    const t = m[1].trim();
++    if (t && !tags.includes(t)) tags.push(t);
++  }
++  return tags.slice(0, 8);
++}
++
++/**
++ * 读一条链接，返回能读到的字段。读不到关键内容时抛错，由调用方转成提示。
++ * @param {string} rawUrl
++ * @param {{browseLocked?: boolean}} opts
++ */
++export async function readLink(rawUrl, { browseLocked = false } = {}) {
++  const input = String(rawUrl ?? '').trim();
++  if (!input) throw new Error('链接为空');
++  const startUrl = /^https?:\/\//i.test(input) ? input : `https://${input}`;
++  if (!/^https?:\/\//i.test(startUrl)) throw new Error('只支持 http(s) 链接');
++
++  // safeFetch 会逐跳跟随重定向（含短链），最终 url 以它返回的为准。
++  const res = await safeFetch(startUrl, { browseLocked, maxBytes: MAX_BYTES });
++  const html = String(res.body ?? '');
++  const finalUrl = String(res.url || startUrl);
++  const platform = detectPlatform(finalUrl);
++
++  const meta = metaMap(html);
++  const ld = jsonLd(html);
++  const ldArticle = ld.find((x) => typeof x?.articleBody === 'string') || {};
++  const ldAuthor = ld.map((x) => x?.author).find((a) => a && (typeof a === 'string' || a?.name));
++
++  const title = (meta['og:title'] || meta['twitter:title'] || ldArticle.headline
++    || (html.match(/<title[^>]*>([\s\S]{1,300}?)<\/title>/i) || [])[1] || '').trim();
++  const description = (meta['og:description'] || meta.description || meta['twitter:description'] || '').trim();
++
++  let body = String(ldArticle.articleBody || '').trim() || articleBody(html) || embeddedDesc(html);
++  body = plain(body).slice(0, BODY_LIMIT);
++
++  let author = '';
++  if (typeof ldAuthor === 'string') author = ldAuthor.trim();
++  else if (ldAuthor?.name) author = String(ldAuthor.name).trim();
++  if (!author) author = (meta.author || meta['og:article:author'] || '').trim();
++  if (!author) {
++    const nick = String(html).match(/"nickname"\s*:\s*"([^"]{1,40})"/);
++    if (nick) author = nick[1];
++  }
++
++  const cleanTitle = plain(title).replace(/\s*[-_|]\s*(小红书|哔哩哔哩|bilibili\.com|知乎|抖音|微博)\s*$/i, '');
++  const cleanDesc = plain(description);
++  if (!cleanTitle && !cleanDesc && !body) {
++    throw new Error(`页面没有可读内容（可能需要登录、或帖子已删除）：${platform}`);
++  }
++
++  // B 站/知乎这类站点对没有 JS 的请求会回一个「出错啦」页，标题本身就是错的，不能当内容用。
++  if (/^(出错啦|页面不存在|404|你访问的页面不见了|访问过于频繁)/.test(cleanTitle) && !cleanDesc) {
++    throw new Error(`${platform}这次没打开（被站点挡了或页面已经没了），别猜里面写了什么；可以让对方发截图或原文。`);
++  }
++
++  // 三十来个字的「正文」多半是页面骨架，不算真的读到内容。
++  const meaningful = body.length >= 120;
++  const note = meaningful
++    ? ''
++    : `${platform}这条只拿到标题和简介，正文需要登录或 App 内查看，别猜内容。`;
++
++  return {
++    ok: true,
++    url: finalUrl,
++    platform,
++    title: cleanTitle,
++    description: cleanDesc,
++    author,
++    tags: tagsOf(`${cleanTitle} ${cleanDesc}`),
++    body,
++    bodyAvailable: meaningful,
++    note
++  };
++}
+diff -ruN a/src/tools.js b/src/tools.js
+--- a/src/tools.js	2026-11-07 21:14:16.512304200 +0800
++++ b/src/tools.js	2026-11-07 21:14:17.334761400 +0800
+@@ -12,6 +12,7 @@
+ import { skillManager } from './skills/manager.js';
+ import { validateImageUrl, safeFetchBinary, browseLockState, checkBrowseLock } from './safe-fetch.js';
+ import { webSearch, webFetch } from './web-search.js';
++import { readLink } from './link-preview.js';
+ import { expandForwardNodes } from './onebot.js';
+ import { registerTool, listTools } from './tool-registry.js';
+ import { holidayOn, upcomingHoliday } from './holidays.js';
+@@ -778,7 +779,7 @@
+   registerTool({
+     id: 'web_search',
+     name: '联网搜索',
+-    description: '联网搜索（Bing），返回标题/URL/摘要列表。适用：实时信息、新闻热点、网络用语/梗的含义、自己不确定的事实。可以换关键词连续搜 2~3 次；对最相关的 1~2 个结果用 web_fetch 读正文，不要只看摘要。',
++    description: '联网搜索，返回标题/URL/摘要列表。事实题（歌词、歌名、影视、人物、新闻、数据）必用，而且要换不同措辞至少搜两次；对最相关的 1~2 个结果用 web_fetch 读正文，只有摘要不足以定论。搜不到就照实说，别凭记忆编。',
+     category: 'web',
+     icon: '🔍',
+     requiresSearch: true,
+@@ -829,6 +830,28 @@
+       }
+     }
+   });
++
++  registerTool({
++    id: 'read_link',
++    name: '读链接',
++    description: '读一条链接的标题、简介、作者和正文摘要（小红书/抖音/公众号常常只给标题和简介，bodyAvailable=false）。拿到标题后可以用 web_search 继续找内容；还找不到就跟对方要截图或原文，不要猜链接里讲了什么。',
++    category: 'web',
++    icon: '🔗',
++    requiresSearch: true,
++    parameters: {
++      type: 'object',
++      properties: { url: { type: 'string', description: 'http(s) 链接，短链也可以' } },
++      required: ['url']
++    },
++    async execute(ctx, args) {
++      try {
++        const r = await readLink(String(args.url ?? ''), { browseLocked: browseLockState().enabled });
++        return ok(r);
++      } catch (error) {
++        return err(`读链接失败：${error?.message ?? error}`);
++      }
++    }
++  });
+ 
+   registerTool({
+     id: 'finish',
+diff -ruN a/src/web-search.js b/src/web-search.js
+--- a/src/web-search.js	2026-11-07 21:14:14.896353600 +0800
++++ b/src/web-search.js	2026-11-07 21:14:15.693794200 +0800
+@@ -105,13 +105,73 @@
+   return { query, results };
+ }
+ 
++/**
++ * 搜狗结果页解析（h3.vr-title 里的标题 + 其后的摘要）。
++ * 它只在 DeepSeek 搜索连续失败时兜底用：拿得到标题就能让模型去核对，
++ * 拿不到结构化来源也比"搜索直接报错、模型只好凭记忆答"强。
++ */
++export function parseSogouResults(html, maxResults = 6) {
++  const out = [];
++  const seen = new Set();
++  const text = String(html ?? '');
++  const re = /<h3[^>]*class="[^"]*vr-title[^"]*"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]{1,300}?)<\/a>/gi;
++  for (const m of text.matchAll(re)) {
++    let url = decodeHtml(m[1]);
++    if (url.startsWith('/')) url = 'https://www.sogou.com' + url;
++    const title = plainText(m[2]);
++    if (!title || seen.has(title)) continue;
++    seen.add(title);
++    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 1500).split('<h3')[0];
++    const sn = after.match(/<(?:div|p)[^>]*class="[^"]*(?:str_info|str-text|text-layout|space-txt|fz-mid)[^"]*"[^>]*>([\s\S]{10,400}?)<\/(?:div|p)>/i);
++    out.push({ title, url, snippet: sn ? plainText(sn[1]) : '' });
++    if (out.length >= maxResults) break;
++  }
++  return out;
++}
++
++function plainText(html) {
++  return decodeHtml(String(html ?? '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
++}
++
++/** 搜狗搜索兜底。返回结构与 bingSearch 一致。 */
++export async function sogouSearch(query) {
++  const url = `https://www.sogou.com/web?query=${encodeURIComponent(sanitizeQuery(query))}`;
++  const res = await fetch(url, {
++    headers: {
++      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
++      'accept-language': 'zh-CN,zh;q=0.9'
++    },
++    signal: AbortSignal.timeout(15000)
++  });
++  if (!res.ok) throw new Error(`搜狗搜索 HTTP ${res.status}`);
++  const results = parseSogouResults(await res.text(), Math.max(1, Math.min(10, Number(getConfig().webSearch?.maxResults) || 6)));
++  if (!results.length) throw new Error('搜狗搜索没有解析到结果（页面结构可能已改版）');
++  return { query, results };
++}
++
+ /** 给工具用的统一入口：搜索 + 紧凑序列化。 */
+ export async function webSearch(query) {
+   const clean = sanitizeQuery(query);
+   if (!clean) throw new Error('查询词为空');
+   const cfg = getConfig().webSearch ?? {};
+   const provider = String(cfg.provider || 'bing').toLowerCase();
+-  if (provider === 'deepseek') return deepSeekSearch(clean);
++  if (provider === 'deepseek') {
++    // 事实题不能因为一次网络抖动就失败：解析出错/超时先重试一次，
++    // 仍不行就用搜狗抓取兜底（至少给标题，让模型能核对或承认查不到）。
++    try {
++      return await deepSeekSearch(clean);
++    } catch (first) {
++      try {
++        return await deepSeekSearch(clean);
++      } catch {
++        try {
++          return await sogouSearch(clean);
++        } catch {
++          throw first;
++        }
++      }
++    }
++  }
+   if (provider === 'zhipu') return zhipuSearch(clean);
+   if (provider === 'bocha') return bochaSearch(clean);
+   if (provider === 'baidu') return baiduSearch(clean);
